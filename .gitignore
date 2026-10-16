@@ -1,0 +1,12 @@
+.DS_Store
+build/
+xcuserdata/
+*.p12
+
+# Local scratch: library source checkouts (our changes live in third_party/), test data and scripts
+dl/
+bin/
+dummy_*.bin
+test*.py
+test.js
+*.profraw

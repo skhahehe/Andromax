@@ -1,0 +1,216 @@
+diff --git a/src/libmtp.c b/src/libmtp.c
+index b33e6970..0b0f941b 100644
+--- a/src/libmtp.c
++++ b/src/libmtp.c
+@@ -2823,6 +2823,133 @@ static int get_all_metadata_fast(LIBMTP_mtpdevice_t *device)
+   return 0;
+ }
+ 
++/**
++ * Andromax: list the immediate children of a folder with a few bulk
++ * GetObjectPropList requests (one per property) instead of one GetObjectInfo
++ * per object, which turns folders with thousands of photos from minutes into
++ * seconds. Single properties are asked for because Android rejects the
++ * "all properties" form for some folders (0xA801).
++ * @param storage storage to keep (0 = any).
++ * @param parent folder id, or LIBMTP_FILES_AND_FOLDERS_ROOT.
++ * @param out receives the list (may be NULL when the folder is empty).
++ * @return 0 on success, -1 when the device can't do this (use
++ *         LIBMTP_Get_Files_And_Folders() instead).
++ */
++struct andromax_child { uint32_t handle; LIBMTP_file_t *file; };
++
++static int andromax_child_cmp(const void *a, const void *b)
++{
++  uint32_t x = ((const struct andromax_child *) a)->handle;
++  uint32_t y = ((const struct andromax_child *) b)->handle;
++  return x < y ? -1 : x > y;
++}
++
++int LIBMTP_Get_Children_Fast(LIBMTP_mtpdevice_t *device,
++			     uint32_t const storage,
++			     uint32_t const parent,
++			     LIBMTP_file_t **out)
++{
++  static const uint16_t codes[] = {
++    PTP_OPC_ObjectFileName, PTP_OPC_ObjectFormat, PTP_OPC_ObjectSize,
++    PTP_OPC_DateModified, PTP_OPC_StorageID
++  };
++  PTPParams *params = (PTPParams *) device->params;
++  PTP_USB *ptp_usb = (PTP_USB*) device->usbinfo;
++  uint32_t handle = parent == LIBMTP_FILES_AND_FOLDERS_ROOT ? 0 : parent;
++  struct andromax_child *children = NULL;
++  int count = 0, oldtimeout, c, j, failed = 0;
++  LIBMTP_file_t *kept = NULL, *last = NULL;
++
++  *out = NULL;
++  if (!ptp_operation_issupported(params, PTP_OC_MTP_GetObjPropList))
++    return -1;
++
++  get_usb_device_timeout(ptp_usb, &oldtimeout);
++  set_usb_device_timeout(ptp_usb, 60000);
++  for (c = 0; c < (int) (sizeof(codes) / sizeof(codes[0])) && !failed; c++) {
++    MTPObjectProp *props = NULL;
++    int nrofprops = 0;
++    uint16_t ret = ptp_mtp_getobjectproplist_generic(params, handle, 0, codes[c], 0, 1,
++                                                     &props, &nrofprops);
++    if (ret != PTP_RC_OK) {
++      add_ptp_error_to_errorstack(device, ret, "LIBMTP_Get_Children_Fast(): "
++				  "could not get proplist of children.");
++      failed = 1;
++      break;
++    }
++    if (c == 0) {
++      /* The file names define the set of children. */
++      children = calloc(nrofprops ? nrofprops : 1, sizeof(*children));
++      for (j = 0; j < nrofprops && children; j++) {
++        LIBMTP_file_t *file = LIBMTP_new_file_t();
++        if (file == NULL) { failed = 1; break; }
++        file->item_id = props[j].ObjectHandle;
++        file->parent_id = handle;
++        file->storage_id = storage;
++        file->filename = strdup(props[j].Value.str ? props[j].Value.str : "<null>");
++        children[count].handle = file->item_id;
++        children[count].file = file;
++        count++;
++      }
++      if (children == NULL) failed = 1;
++      qsort(children, count, sizeof(*children), andromax_child_cmp);
++    } else {
++      for (j = 0; j < nrofprops; j++) {
++        struct andromax_child key = { props[j].ObjectHandle, NULL };
++        struct andromax_child *hit = bsearch(&key, children, count, sizeof(*children), andromax_child_cmp);
++        LIBMTP_file_t *file = hit ? hit->file : NULL;
++        if (file == NULL) continue;
++        switch (codes[c]) {
++        case PTP_OPC_ObjectFormat:
++          file->filetype = map_ptp_type_to_libmtp_type(props[j].Value.u16);
++          break;
++        case PTP_OPC_ObjectSize:
++          file->filesize = props[j].DataType == PTP_DTC_UINT64 ? props[j].Value.u64 : props[j].Value.u32;
++          break;
++        case PTP_OPC_StorageID:
++          file->storage_id = props[j].Value.u32;
++          break;
++        case PTP_OPC_DateModified:
++          if (props[j].Value.str != NULL) {
++            struct tm tm;
++            memset(&tm, 0, sizeof(tm));
++            /* MTP dates look like "20231004T153012", in the phone's local time */
++            if (sscanf(props[j].Value.str, "%4d%2d%2dT%2d%2d%2d", &tm.tm_year, &tm.tm_mon,
++                       &tm.tm_mday, &tm.tm_hour, &tm.tm_min, &tm.tm_sec) == 6) {
++              tm.tm_year -= 1900;
++              tm.tm_mon -= 1;
++              tm.tm_isdst = -1;
++              file->modificationdate = mktime(&tm);
++            }
++          }
++          break;
++        }
++      }
++    }
++    for (j = 0; j < nrofprops; j++)
++      if (props[j].DataType == PTP_DTC_STR)
++        free(props[j].Value.str);
++    free(props);
++  }
++  set_usb_device_timeout(ptp_usb, oldtimeout);
++
++  /* Keep the device's order, minus the folder itself and other storages. */
++  for (j = 0; j < count; j++) {
++    LIBMTP_file_t *file = children[j].file;
++    if (failed || file->item_id == handle || (storage != 0 && file->storage_id != storage)) {
++      LIBMTP_destroy_file_t(file);
++      continue;
++    }
++    if (last) last->next = file; else kept = file;
++    last = file;
++  }
++  free(children);
++  if (failed)
++    return -1;
++  *out = kept;
++  return 0;
++}
++
+ /**
+  * This function will recurse through all the directories on the device,
+  * starting at the root directory, gathering metadata as it moves along.
+diff --git a/src/libmtp.h.in b/src/libmtp.h.in
+index c1deaea1..6fd8be2c 100644
+--- a/src/libmtp.h.in
++++ b/src/libmtp.h.in
+@@ -922,6 +922,8 @@ LIBMTP_file_t *LIBMTP_Get_Filelisting_With_Callback(LIBMTP_mtpdevice_t *,
+ 
+ #define LIBMTP_FILES_AND_FOLDERS_ROOT 0xffffffff
+ 
++int LIBMTP_Get_Children_Fast(LIBMTP_mtpdevice_t *, uint32_t const,
++			     uint32_t const, LIBMTP_file_t **);
+ LIBMTP_file_t * LIBMTP_Get_Files_And_Folders(LIBMTP_mtpdevice_t *,
+ 					     uint32_t const,
+ 					     uint32_t const);
+diff --git a/src/libmtp.sym b/src/libmtp.sym
+index c84c2c9d..025f9063 100644
+--- a/src/libmtp.sym
++++ b/src/libmtp.sym
+@@ -51,6 +51,7 @@ LIBMTP_Get_Filetype_Description
+ LIBMTP_Get_Filelisting
+ LIBMTP_Get_Filelisting_With_Callback
+ LIBMTP_Get_Files_And_Folders
++LIBMTP_Get_Children_Fast
+ LIBMTP_Get_Children
+ LIBMTP_Get_Filemetadata
+ LIBMTP_Get_File_To_File
+diff --git a/src/libusb1-glue.c b/src/libusb1-glue.c
+index 9f8f20e3..76e5e875 100644
+--- a/src/libusb1-glue.c
++++ b/src/libusb1-glue.c
+@@ -52,7 +52,8 @@
+  * spend a bit of time collecting data.  Higher values also
+  * make connecting/disconnecting more reliable.
+  */
+-#define USB_START_TIMEOUT 5000
++/* Andromax: a healthy phone answers OpenSession at once; a wedged one is reset sooner. */
++#define USB_START_TIMEOUT 2000
+ #define USB_TIMEOUT_DEFAULT     20000
+ #define USB_TIMEOUT_LONG        60000
+ static inline int get_timeout(PTP_USB* ptp_usb)
+@@ -2317,11 +2318,19 @@ LIBMTP_error_number_t configure_usb_device(LIBMTP_raw_device_t *device,
+    * This works in situations where previous bad applications
+    * have not used LIBMTP_Release_Device on exit
+    */
+-  if ((ret = ptp_opensession(params, 1)) == PTP_ERROR_IO) {
++  ret = ptp_opensession(params, 1);
++  if (ret == PTP_ERROR_IO) {
+     LIBMTP_ERROR("PTP_ERROR_IO: failed to open session, trying again after resetting USB interface\n");
+     LIBMTP_ERROR("LIBMTP libusb: Attempt to reset device\n");
+     libusb_reset_device (ptp_usb->handle);
+     close_usb(ptp_usb);
++#ifdef __APPLE__
++    /* Andromax: on macOS the reset re-enumerates the device, so this handle is dead and a
++       second try only waits out the full timeout. Let the caller detect it again instead. */
++    libusb_free_device_list (devs, 0);
++    free (ptp_usb);
++    return LIBMTP_ERROR_CONNECTING;
++#endif
+ 
+     if(init_ptp_usb(params, ptp_usb, ldevice) <0) {
+       LIBMTP_ERROR("LIBMTP PANIC: Could not init USB on second attempt\n");
+@@ -2334,6 +2343,8 @@ LIBMTP_error_number_t configure_usb_device(LIBMTP_raw_device_t *device,
+     /* Device has been reset, try again */
+     if ((ret = ptp_opensession(params, 1)) == PTP_ERROR_IO) {
+       LIBMTP_ERROR("LIBMTP PANIC: failed to open session on second attempt\n");
++      /* Andromax: release the claimed interface, or every later open in this process fails. */
++      close_usb(ptp_usb);
+       libusb_free_device_list (devs, 0);
+       free (ptp_usb);
+       return LIBMTP_ERROR_CONNECTING;
+@@ -2351,7 +2362,7 @@ LIBMTP_error_number_t configure_usb_device(LIBMTP_raw_device_t *device,
+     LIBMTP_ERROR("LIBMTP PANIC: Could not open session! "
+ 	    "(Return code %d)\n  Try to reset the device.\n",
+ 	    ret);
+-    libusb_release_interface(ptp_usb->handle, ptp_usb->interface);
++    close_usb(ptp_usb);
+     libusb_free_device_list (devs, 0);
+     free (ptp_usb);
+     return LIBMTP_ERROR_CONNECTING;
