@@ -132,16 +132,12 @@ To rebuild them, apply the patch to a libmtp checkout and configure both project
 
 ## Releases (CI/CD)
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml) builds the universal app and DMG on every push to `main` and every pull request, and uploads the DMG as a workflow artifact.
+[`.github/workflows/build.yml`](.github/workflows/build.yml) runs on GitHub Actions:
 
-To publish a release, push a version tag:
+- **Every push to `main`** builds the universal app and DMG and publishes it as the next GitHub Release, bumping the patch number automatically (`v1.0.0`, `v1.0.1`, `v1.0.2`, ...). The DMG (app + installer script) is attached to the release.
+- **Pull requests** are built (the DMG is kept as a workflow artifact) but not released.
 
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-The workflow then creates a GitHub Release named after the tag with `Andromax-1.0.0.dmg` (app + installer script) attached.
+To start a new major or minor version, push a tag once, for example `git tag v2.0.0 && git push origin v2.0.0`; the next commits continue from it (`v2.0.1`, ...).
 
 ## Contributing
 
